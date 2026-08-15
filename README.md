@@ -94,3 +94,10 @@ const PREFERRED_LANGUAGE = "python3";
 公開向けの詳細は以下を参照してください。
 
 - `PAIZA_SPEC_AND_DISCLAIMER.md`
+
+ライセンスについては以下を参照してください
+-`LISENCE`
+
+
+issueやPRは歓迎です。
+作成者は初心者なので、手加減していただけると大変たすかります。
