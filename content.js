@@ -12,7 +12,7 @@
     { value: "javascript", label: "JavaScript" }
   ];
   const FALLBACK_LANGUAGE = "python3";
-  // 普段使う言語をここで変更できます（python3 / cpp / c / javascript）README参照
+  // 普段使う言語をここで変更できます（python3 / cpp / c / javascript）READMEとPAIZA_SPEC_AND_DISCLAIMER.md参照
   const PREFERRED_LANGUAGE = "python3";
 
   function getInitialLanguage() {
