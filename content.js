@@ -14,6 +14,14 @@
   const FALLBACK_LANGUAGE = "python3";
   // 普段使う言語をここで変更できます（python3 / cpp / c / javascript）READMEとPAIZA_SPEC_AND_DISCLAIMER.md参照
   const PREFERRED_LANGUAGE = "python3";
+  // 本体実行する言語。cpp/c は paiza.IO フォールバック。
+  const LOCAL_LANGUAGES = ["javascript", "python3"];
+  const PYODIDE_VERSION = "0.26.4";
+  // Blob Worker内から同梱Pyodideを読めない場合の予備 (CDN)。
+  const PYODIDE_CDN_BASE = "https://cdn.jsdelivr.net/pyodide/v" + PYODIDE_VERSION + "/full/";
+  let pyodideWorker = null;
+  let pyodideWorkerSeq = 0;
+  const pyodideWorkerPending = new Map();
 
   function getInitialLanguage() {
     if (LANGUAGE_OPTIONS.some((lang) => lang.value === PREFERRED_LANGUAGE)) {
@@ -114,7 +122,7 @@
     panel.innerHTML = [
       '<div class="aotr-header">',
       '<h2 class="aotr-title">AtCoder Online Test Runner</h2>',
-      '<p class="aotr-subtitle">入力例をまとめてオンライン実行します（paiza.IO）</p>',
+      '<p class="aotr-subtitle">入力例をまとめて実行します（本体高速実行＋paiza.IOフォールバック）</p>',
       "</div>",
       '<div class="aotr-editor-head">',
       '<label class="aotr-label" for="aotr-editor">コード</label>',
@@ -189,6 +197,9 @@
     });
     languageEl.addEventListener("change", () => {
       saveDraft(editor.value, languageEl.value);
+      if (languageEl.value === "python3") {
+        prewarmPyodideWorker();
+      }
     });
     customInputEl.addEventListener("input", () => {
       saveDraft(editor.value, languageEl.value);
@@ -196,6 +207,10 @@
 
     runButton.addEventListener("click", handleRunAllClick);
     customRunButton.addEventListener("click", handleRunCustomClick);
+
+    if (languageEl.value === "python3") {
+      prewarmPyodideWorker();
+    }
   }
 
   function setStatus(text) {
@@ -203,6 +218,17 @@
     if (statusEl) {
       statusEl.textContent = text;
     }
+  }
+
+  function formatCompletionStatus(items) {
+    const fallbacks = items.filter((item) => item.engine === "paiza" && item.fallbackReason);
+    if (fallbacks.length === 0) {
+      const usedPaiza = items.some((item) => item.engine === "paiza");
+      return usedPaiza ? "完了 (paiza.IO)" : "完了 (本体実行)";
+    }
+    const reason = String(fallbacks[0].fallbackReason || "");
+    const short = reason.length > 80 ? reason.slice(0, 80) + "…" : reason;
+    return "完了 (本体→paizaにフォールバック: " + short + ")";
   }
 
   function setError(message) {
@@ -306,6 +332,8 @@
         const runtime = formatSeconds(item.detail.time);
         const memory = formatMemory(item.detail.memory);
         const title = item.title || ("Case " + item.caseNumber);
+        const engine = item.engine === "paiza" ? "paiza" : "local";
+        const engineLabel = engine === "paiza" ? "paiza" : "local";
         const expectedOutputBlock =
           typeof expectedOutput === "string"
             ? '<div><h4>想定出力</h4><pre>' + escapeHtml(expectedOutput || "(empty)") + "</pre></div>"
@@ -316,6 +344,7 @@
           '<div class="aotr-case-header">',
           '<h3 class="aotr-case-title">' + escapeHtml(title) + "</h3>",
           '<span class="aotr-badge ' + resultBadgeClass(item.judgement) + '">' + item.judgement + "</span>",
+          '<span class="aotr-engine">Engine: ' + escapeHtml(engineLabel) + "</span>",
           '<span class="aotr-time">Time: ' + runtime + "</span>",
           '<span class="aotr-memory">Memory: ' + memory + "</span>",
           "</div>",
@@ -378,6 +407,310 @@
       sourceCode,
       selectedLanguage: languageEl.value
     };
+  }
+
+  function getPyodideAssetUrls() {
+    const runtimeApi = extensionApi && extensionApi.runtime;
+    const getUrl =
+      runtimeApi && typeof runtimeApi.getURL === "function"
+        ? (path) => runtimeApi.getURL(path)
+        : null;
+    if (!getUrl) {
+      throw new Error("拡張機能のURLを取得できません。");
+    }
+    const base = getUrl("vendor/pyodide/");
+    return {
+      pyodideJsUrl: base + "pyodide.js",
+      indexURL: base,
+      cdnJsUrl: PYODIDE_CDN_BASE + "pyodide.js",
+      cdnIndexURL: PYODIDE_CDN_BASE
+    };
+  }
+
+  // Pyodideを動かすBlob Workerの起動コード。
+  // ページ由来のWorkerなので拡張機能CSPの影響を受けず、Chrome/Firefox共通で動く。
+  function buildPyodideWorkerSource(urls) {
+    return [
+      "const __AOTR_URLS = " + JSON.stringify(urls) + ";",
+      "let __aotr_pyodide = null;",
+      "async function __aotr_ensure() {",
+      "  if (__aotr_pyodide) return __aotr_pyodide;",
+      "  try {",
+      "    importScripts(__AOTR_URLS.pyodideJsUrl);",
+      "    __aotr_pyodide = await loadPyodide({ indexURL: __AOTR_URLS.indexURL });",
+      "    return __aotr_pyodide;",
+      "  } catch (e) {",
+      "    self.postMessage({ type: 'AOTR_PYODIDE_VENDOR_FAILED', error: (e && e.message) || String(e) });",
+      "  }",
+      "  importScripts(__AOTR_URLS.cdnJsUrl);",
+      "  __aotr_pyodide = await loadPyodide({ indexURL: __AOTR_URLS.cdnIndexURL });",
+      "  return __aotr_pyodide;",
+      "}",
+      "async function __aotr_run(id, sourceCode, input) {",
+      "  const started = performance.now();",
+      "  try {",
+      "    const pyodide = await __aotr_ensure();",
+      "    pyodide.globals.set('__aotr_input_text', (typeof input === 'string') ? input : '');",
+      "    await pyodide.runPythonAsync('import io, sys\\nsys.stdin = io.StringIO(__aotr_input_text)\\nsys.stdout = io.StringIO()\\nsys.stderr = io.StringIO()\\n');",
+      "    let stderr = '';",
+      "    try {",
+      "      await pyodide.runPythonAsync(sourceCode);",
+      "    } catch (e) {",
+      "      try { stderr = await pyodide.runPythonAsync('sys.stderr.getvalue()'); } catch (ignored) {}",
+      "      if (!stderr) stderr = (e && e.message) || String(e);",
+      "    }",
+      "    let stdout = '';",
+      "    try { stdout = await pyodide.runPythonAsync('sys.stdout.getvalue()'); } catch (ignored) {}",
+      "    if (!stderr) { try { stderr = await pyodide.runPythonAsync('sys.stderr.getvalue()'); } catch (ignored) {} }",
+      "    self.postMessage({ id, ok: true, result: { status: 'completed', detail: { stdout: (typeof stdout === 'string') ? stdout : String(stdout || ''), stderr: (typeof stderr === 'string') ? stderr : String(stderr || ''), time: (performance.now() - started) / 1000, memory: -1, build_result: '', build_stdout: '', build_stderr: '' } } });",
+      "  } catch (e) {",
+      "    self.postMessage({ id, ok: false, error: (e && e.message) || String(e) });",
+      "  }",
+      "}",
+      "self.onmessage = function (event) {",
+      "  const msg = event.data || {};",
+      "  if (msg.type === 'AOTR_RUN_PYTHON') { __aotr_run(msg.id, msg.payload.sourceCode, msg.payload.input); }",
+      "  else if (msg.type === 'AOTR_WARMUP') { __aotr_ensure().then(function () { self.postMessage({ type: 'AOTR_WARMED' }); }, function (e) { self.postMessage({ type: 'AOTR_WARMED', error: (e && e.message) || String(e) }); }); }",
+      "};"
+    ].join("\n");
+  }
+
+  function ensurePyodideWorker() {
+    if (pyodideWorker) {
+      return pyodideWorker;
+    }
+    if (typeof Worker === "undefined" || typeof Blob === "undefined") {
+      throw new Error("この環境ではWeb Workerが使えません。");
+    }
+    const urls = getPyodideAssetUrls();
+    const blob = new Blob([buildPyodideWorkerSource(urls)], { type: "text/javascript" });
+    const blobUrl = URL.createObjectURL(blob);
+    const worker = new Worker(blobUrl);
+    worker.onmessage = (event) => {
+      const data = event.data;
+      if (!data || typeof data !== "object") {
+        return;
+      }
+      if (typeof data.id !== "undefined") {
+        const pending = pyodideWorkerPending.get(data.id);
+        if (pending) {
+          pyodideWorkerPending.delete(data.id);
+          pending(data);
+        }
+      }
+    };
+    worker.onerror = (event) => {
+      const message =
+        (event && event.message) || (event && event.error && event.error.message) || "Worker error";
+      pyodideWorkerPending.forEach((pending) => {
+        try {
+          pending({ ok: false, error: String(message) });
+        } catch (ignored) {}
+      });
+      pyodideWorkerPending.clear();
+    };
+    pyodideWorker = worker;
+    pyodideWorker._aotrBlobUrl = blobUrl;
+    return worker;
+  }
+
+  function prewarmPyodideWorker() {
+    try {
+      const worker = ensurePyodideWorker();
+      try {
+        worker.postMessage({ type: "AOTR_WARMUP" });
+      } catch (ignored) {}
+    } catch (ignored) {}
+  }
+
+  // 無限ループ等で固まったWorkerを破棄し、次回実行時に作り直す。
+  function resetPyodideWorker() {
+    if (pyodideWorker) {
+      try {
+        pyodideWorker.terminate();
+      } catch (ignored) {}
+      try {
+        URL.revokeObjectURL(pyodideWorker._aotrBlobUrl);
+      } catch (ignored) {}
+      pyodideWorker = null;
+    }
+    pyodideWorkerPending.forEach((pending) => {
+      try {
+        pending({ ok: false, error: "Python実行環境を再生成したため中断しました。" });
+      } catch (ignored) {}
+    });
+    pyodideWorkerPending.clear();
+  }
+
+  function runJavaScriptLocal(sourceCode, input) {
+    const startedAt = performance.now();
+    const safeInput = typeof input === "string" ? input : "";
+    const workerSource = [
+      "let __aotr_stdout = '';",
+      "const __AOTR_INPUT = " + JSON.stringify(safeInput) + ";",
+      "const __aotr_user_code = " + JSON.stringify(sourceCode) + ";",
+      "const __aotr_lines = __AOTR_INPUT.split('\\n');",
+      "let __aotr_lineIdx = 0;",
+      "function __aotr_push(s) { __aotr_stdout += String(s); }",
+      "const __aotr_console = {",
+      "  log: function () { __aotr_push(Array.prototype.map.call(arguments, function (x) { try { return typeof x === 'string' ? x : JSON.stringify(x); } catch (e) { return String(x); } }).join(' ') + '\\n'); },",
+      "  error: function () { __aotr_push(Array.prototype.map.call(arguments, String).join(' ') + '\\n'); },",
+      "  warn: function () { __aotr_push(Array.prototype.map.call(arguments, String).join(' ') + '\\n'); },",
+      "  info: function () { __aotr_push(Array.prototype.map.call(arguments, String).join(' ') + '\\n'); }",
+      "};",
+      "const fs = { readFileSync: function (fd) { if (fd === 0 || fd === '/dev/stdin' || fd === '/dev/stdin.txt') return __AOTR_INPUT; return ''; } };",
+      "function __aotr_require(name) { if (name === 'fs') return fs; throw new Error(\"Cannot find module '\" + name + \"'\"); }",
+      "const process = { argv: ['node', 'main.js'], stdout: { write: function (s) { __aotr_push(s); } }, stderr: { write: function (s) { __aotr_push(s); } }, exit: function (c) { throw new Error('__AOTR_EXIT__:' + c); } };",
+      "function readline() { const v = __aotr_lines[__aotr_lineIdx]; __aotr_lineIdx += 1; return v === undefined ? '' : v; }",
+      "try {",
+      "  const __aotr_fn = new Function('console', 'require', 'fs', 'process', 'readline', 'module', 'exports', __aotr_user_code);",
+      "  __aotr_fn(__aotr_console, __aotr_require, fs, process, readline, { exports: {} }, {});",
+      "  self.postMessage({ ok: true, stdout: __aotr_stdout, stderr: '' });",
+      "} catch (e) {",
+      "  const msg = (e && e.message) ? e.message : String(e);",
+      "  if (msg.indexOf('__AOTR_EXIT__:') === 0) { self.postMessage({ ok: true, stdout: __aotr_stdout, stderr: '' }); }",
+      "  else { self.postMessage({ ok: false, stdout: __aotr_stdout, stderr: msg + '\\n' + ((e && e.stack) ? e.stack : '') }); }",
+      "}"
+    ].join("\n");
+
+    return new Promise((resolve, reject) => {
+      if (typeof Worker === "undefined") {
+        reject(new Error("この環境ではWeb Workerが使えません。"));
+        return;
+      }
+      const finish = (status, stdout, stderr) => {
+        const elapsed = (performance.now() - startedAt) / 1000;
+        resolve({
+          status,
+          detail: {
+            stdout: stdout || "",
+            stderr: stderr || "",
+            time: elapsed,
+            memory: -1,
+            build_result: "",
+            build_stdout: "",
+            build_stderr: ""
+          }
+        });
+      };
+      let worker = null;
+      try {
+        const blob = new Blob([workerSource], { type: "text/javascript" });
+        const url = URL.createObjectURL(blob);
+        worker = new Worker(url);
+        const timer = setTimeout(() => {
+          try {
+            worker.terminate();
+          } catch (ignored) {}
+          try {
+            URL.revokeObjectURL(url);
+          } catch (ignored) {}
+          finish("timeout", "", "");
+        }, Math.ceil(EXECUTION_TIME_LIMIT_SECONDS * 1000));
+        worker.onmessage = (event) => {
+          clearTimeout(timer);
+          try {
+            worker.terminate();
+          } catch (ignored) {}
+          try {
+            URL.revokeObjectURL(url);
+          } catch (ignored) {}
+          const data = event.data || {};
+          finish("completed", data.stdout || "", data.stderr || "");
+        };
+        worker.onerror = (event) => {
+          clearTimeout(timer);
+          try {
+            worker.terminate();
+          } catch (ignored) {}
+          try {
+            URL.revokeObjectURL(url);
+          } catch (ignored) {}
+          const message =
+            (event && event.message) || (event && event.error && event.error.message) || "Worker error";
+          finish("completed", "", String(message));
+        };
+      } catch (error) {
+        // Worker生成自体の失敗は環境起因とみなし、paizaフォールバックのためrejectする。
+        reject(error instanceof Error ? error : new Error(String(error)));
+      }
+    });
+  }
+
+  function runPythonLocal(sourceCode, input) {
+    let worker;
+    try {
+      worker = ensurePyodideWorker();
+    } catch (error) {
+      return Promise.reject(error instanceof Error ? error : new Error(String(error)));
+    }
+    return new Promise((resolve, reject) => {
+      const id = (pyodideWorkerSeq += 1);
+      const timer = setTimeout(() => {
+        pyodideWorkerPending.delete(id);
+        resetPyodideWorker();
+        reject(new Error("Python本体実行がタイムアウトしました。"));
+      }, 30000);
+      pyodideWorkerPending.set(id, (response) => {
+        clearTimeout(timer);
+        if (response && response.ok) {
+          resolve(response.result);
+        } else {
+          reject(new Error((response && response.error) || "Python本体実行に失敗しました。"));
+        }
+      });
+      try {
+        worker.postMessage({ type: "AOTR_RUN_PYTHON", id, payload: { sourceCode, input } });
+      } catch (error) {
+        clearTimeout(timer);
+        pyodideWorkerPending.delete(id);
+        resetPyodideWorker();
+        reject(error instanceof Error ? error : new Error(String(error)));
+      }
+    });
+  }
+
+  function isLocalLanguage(language) {
+    return LOCAL_LANGUAGES.indexOf(language) !== -1;
+  }
+
+  function toFallbackResult(runResult, localError) {
+    const reason = localError instanceof Error ? localError.message : String(localError);
+    const detail = runResult.detail || {};
+    const note = "[本体実行に失敗したためpaiza.IOにフォールバック: " + reason + "]";
+    detail.build_stderr = detail.build_stderr ? detail.build_stderr + "\n" + note : note;
+    runResult.detail = detail;
+    return { runResult, engine: "paiza", fallbackReason: reason };
+  }
+
+  function runCaseWithEngine(payload, hooks) {
+    const notify = (hooks && hooks.onPythonWarmup) || null;
+    if (payload.language === "javascript") {
+      return runJavaScriptLocal(payload.sourceCode, payload.input).then(
+        (runResult) => ({ runResult, engine: "local" }),
+        (localError) => runPaizaCase(payload).then((runResult) => toFallbackResult(runResult, localError))
+      );
+    }
+    if (payload.language === "python3") {
+      if (notify) {
+        try {
+          notify();
+        } catch (ignored) {}
+      }
+      return runPythonLocal(payload.sourceCode, payload.input).then(
+        (runResult) => {
+          if (runResult && runResult.status === "timeout") {
+            resetPyodideWorker();
+          }
+          return { runResult, engine: "local" };
+        },
+        (localError) => {
+          resetPyodideWorker();
+          return runPaizaCase(payload).then((runResult) => toFallbackResult(runResult, localError));
+        }
+      );
+    }
+    return runPaizaCase(payload).then((runResult) => ({ runResult, engine: "paiza" }));
   }
 
   function runPaizaCase(payload) {
@@ -450,11 +783,21 @@
         const testCase = testCases[i];
         setStatus("実行中... Case " + testCase.caseNumber + "/" + testCases.length);
 
-        const runResult = await runPaizaCase({
-          sourceCode,
-          language: selectedLanguage,
-          input: testCase.input
-        });
+        const executed = await runCaseWithEngine(
+          {
+            sourceCode,
+            language: selectedLanguage,
+            input: testCase.input
+          },
+          {
+            onPythonWarmup: () => {
+              setStatus(
+                "実行中... Case " + testCase.caseNumber + "/" + testCases.length + " (本体準備中)"
+              );
+            }
+          }
+        );
+        const runResult = executed.runResult;
 
         const detail = runResult.detail || {};
         const judgement = judgeCase(runResult, testCase.output);
@@ -463,12 +806,14 @@
           input: testCase.input,
           expectedOutput: testCase.output,
           detail,
-          judgement
+          judgement,
+          engine: executed.engine,
+          fallbackReason: executed.fallbackReason
         });
       }
 
       renderResults(results);
-      setStatus("完了");
+      setStatus(formatCompletionStatus(results));
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       setError("実行中にエラーが発生しました: " + message);
@@ -510,11 +855,12 @@
     setStatus("標準入力で実行中...");
 
     try {
-      const runResult = await runPaizaCase({
+      const executed = await runCaseWithEngine({
         sourceCode,
         language: selectedLanguage,
         input: customInputEl.value
       });
+      const runResult = executed.runResult;
       const detail = runResult.detail || {};
       const judgement = judgeCustomRun(runResult);
       renderResults([
@@ -523,10 +869,14 @@
           caseNumber: 1,
           input: customInputEl.value,
           detail,
-          judgement
+          judgement,
+          engine: executed.engine,
+          fallbackReason: executed.fallbackReason
         }
       ]);
-      setStatus("完了");
+      setStatus(
+        formatCompletionStatus([{ engine: executed.engine, fallbackReason: executed.fallbackReason }])
+      );
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       setError("実行中にエラーが発生しました: " + message);

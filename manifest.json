@@ -1,11 +1,22 @@
 {
   "manifest_version": 3,
   "name": "AtCoder Online Test Runner",
-  "version": "1.0.0",
-  "description": "AtCoder問題ページで入力例を使って全テストをオンライン実行します。",
+  "version": "1.2.0",
+  "description": "AtCoder問題ページで入力例を使って全テストを実行します（本体高速実行＋paiza.IOフォールバック）。",
   "permissions": [],
   "host_permissions": [
-    "https://api.paiza.io/*"
+    "https://api.paiza.io/*",
+    "https://cdn.jsdelivr.net/*"
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "vendor/pyodide/*"
+      ],
+      "matches": [
+        "https://atcoder.jp/*"
+      ]
+    }
   ],
   "background": {
     "service_worker": "background.js",
