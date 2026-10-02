@@ -183,6 +183,9 @@
   font-size: 13px;
   line-height: 1.45;
   user-select: none;
+  /* 合字リガチャ無効化: 「>=」「!=」などを入力通りに表示する */
+  font-variant-ligatures: none;
+  font-feature-settings: "liga" 0, "calt" 0;
 }
 
 .aotr-editor {
@@ -197,6 +200,8 @@
   line-height: 1.45;
   resize: vertical;
   outline: none;
+  font-variant-ligatures: none;
+  font-feature-settings: "liga" 0, "calt" 0;
 }
 
 .aotr-custom-input {
@@ -214,6 +219,8 @@
   line-height: 1.45;
   resize: vertical;
   transition: border-color var(--aotr-motion-fast), background var(--aotr-motion-fast);
+  font-variant-ligatures: none;
+  font-feature-settings: "liga" 0, "calt" 0;
 }
 
 .aotr-custom-input:hover {
@@ -280,6 +287,20 @@
 
 .aotr-run-sub-button:active {
   background: rgba(107, 114, 128, 0.32);
+}
+
+.aotr-stop-button {
+  background: rgba(209, 52, 56, 0.12);
+  color: var(--aotr-danger);
+  border-color: rgba(209, 52, 56, 0.4);
+}
+
+.aotr-stop-button:hover {
+  background: rgba(209, 52, 56, 0.2);
+}
+
+.aotr-stop-button:active {
+  background: rgba(209, 52, 56, 0.28);
 }
 
 .aotr-run-button:disabled {
@@ -462,6 +483,8 @@
   color: var(--aotr-pre-text);
   font-size: 13px;
   line-height: 1.45;
+  font-variant-ligatures: none;
+  font-feature-settings: "liga" 0, "calt" 0;
 }
 
 .aotr-stderr {

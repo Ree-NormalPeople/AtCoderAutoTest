@@ -22,6 +22,39 @@
   let pyodideWorker = null;
   let pyodideWorkerSeq = 0;
   const pyodideWorkerPending = new Map();
+  // 実行中停止のための状態。activeAbortは実行中のローカル処理を中断する関数。
+  let stopRequested = false;
+  let activeAbort = null;
+
+  function isStopError(error) {
+    return !!error && error.isStop === true;
+  }
+
+  function throwIfStopped() {
+    if (stopRequested) {
+      const error = new Error("ユーザーにより停止されました。");
+      error.isStop = true;
+      throw error;
+    }
+  }
+
+  function requestStop() {
+    stopRequested = true;
+    setStatus("停止中...");
+    if (typeof activeAbort === "function") {
+      try {
+        activeAbort();
+      } catch (ignored) {}
+      activeAbort = null;
+    }
+  }
+
+  function setStopButtonEnabled(enabled) {
+    const stopButton = document.getElementById("aotr-stop");
+    if (stopButton && stopButton instanceof HTMLButtonElement) {
+      stopButton.disabled = !enabled;
+    }
+  }
 
   function getInitialLanguage() {
     if (LANGUAGE_OPTIONS.some((lang) => lang.value === PREFERRED_LANGUAGE)) {
@@ -139,6 +172,7 @@
       '<div class="aotr-actions">',
       '<button id="aotr-run-all" class="aotr-run-button" type="button">全テスト実行</button>',
       '<button id="aotr-run-custom" class="aotr-run-button aotr-run-sub-button" type="button">標準入力で実行</button>',
+      '<button id="aotr-stop" class="aotr-run-button aotr-stop-button" type="button" disabled>停止</button>',
       '<span id="aotr-status" class="aotr-status">待機中</span>',
       "</div>",
       '<div id="aotr-error" class="aotr-error" role="alert" aria-live="polite"></div>',
@@ -170,6 +204,10 @@
     }
     if (!customRunButton || !(customRunButton instanceof HTMLButtonElement)) {
       throw new Error("Custom run button was not created.");
+    }
+    const stopButton = document.getElementById("aotr-stop");
+    if (!stopButton || !(stopButton instanceof HTMLButtonElement)) {
+      throw new Error("Stop button was not created.");
     }
 
     const draft = loadDraft();
@@ -207,6 +245,7 @@
 
     runButton.addEventListener("click", handleRunAllClick);
     customRunButton.addEventListener("click", handleRunCustomClick);
+    stopButton.addEventListener("click", requestStop);
 
     if (languageEl.value === "python3") {
       prewarmPyodideWorker();
@@ -599,6 +638,9 @@
         const url = URL.createObjectURL(blob);
         worker = new Worker(url);
         const timer = setTimeout(() => {
+          if (activeAbort === abortCurrent) {
+            activeAbort = null;
+          }
           try {
             worker.terminate();
           } catch (ignored) {}
@@ -607,8 +649,25 @@
           } catch (ignored) {}
           finish("timeout", "", "");
         }, Math.ceil(EXECUTION_TIME_LIMIT_SECONDS * 1000));
+        const abortCurrent = () => {
+          clearTimeout(timer);
+          if (activeAbort === abortCurrent) {
+            activeAbort = null;
+          }
+          try {
+            worker.terminate();
+          } catch (ignored) {}
+          try {
+            URL.revokeObjectURL(url);
+          } catch (ignored) {}
+          finish("stopped", "", "");
+        };
+        activeAbort = abortCurrent;
         worker.onmessage = (event) => {
           clearTimeout(timer);
+          if (activeAbort === abortCurrent) {
+            activeAbort = null;
+          }
           try {
             worker.terminate();
           } catch (ignored) {}
@@ -620,6 +679,9 @@
         };
         worker.onerror = (event) => {
           clearTimeout(timer);
+          if (activeAbort === abortCurrent) {
+            activeAbort = null;
+          }
           try {
             worker.terminate();
           } catch (ignored) {}
@@ -646,13 +708,28 @@
     }
     return new Promise((resolve, reject) => {
       const id = (pyodideWorkerSeq += 1);
+      const abortCurrent = () => {
+        clearTimeout(timer);
+        pyodideWorkerPending.delete(id);
+        resetPyodideWorker();
+        const error = new Error("ユーザーにより停止されました。");
+        error.isStop = true;
+        reject(error);
+      };
       const timer = setTimeout(() => {
+        if (activeAbort === abortCurrent) {
+          activeAbort = null;
+        }
         pyodideWorkerPending.delete(id);
         resetPyodideWorker();
         reject(new Error("Python本体実行がタイムアウトしました。"));
       }, 30000);
+      activeAbort = abortCurrent;
       pyodideWorkerPending.set(id, (response) => {
         clearTimeout(timer);
+        if (activeAbort === abortCurrent) {
+          activeAbort = null;
+        }
         if (response && response.ok) {
           resolve(response.result);
         } else {
@@ -664,6 +741,9 @@
       } catch (error) {
         clearTimeout(timer);
         pyodideWorkerPending.delete(id);
+        if (activeAbort === abortCurrent) {
+          activeAbort = null;
+        }
         resetPyodideWorker();
         reject(error instanceof Error ? error : new Error(String(error)));
       }
@@ -687,8 +767,18 @@
     const notify = (hooks && hooks.onPythonWarmup) || null;
     if (payload.language === "javascript") {
       return runJavaScriptLocal(payload.sourceCode, payload.input).then(
-        (runResult) => ({ runResult, engine: "local" }),
-        (localError) => runPaizaCase(payload).then((runResult) => toFallbackResult(runResult, localError))
+        (runResult) => {
+          if ((runResult && runResult.status === "stopped") || stopRequested) {
+            throwIfStopped();
+          }
+          return { runResult, engine: "local" };
+        },
+        (localError) => {
+          if (isStopError(localError) || stopRequested) {
+            throw isStopError(localError) ? localError : new Error("ユーザーにより停止されました。");
+          }
+          return runPaizaCase(payload).then((runResult) => toFallbackResult(runResult, localError));
+        }
       );
     }
     if (payload.language === "python3") {
@@ -699,18 +789,27 @@
       }
       return runPythonLocal(payload.sourceCode, payload.input).then(
         (runResult) => {
+          if (stopRequested) {
+            throwIfStopped();
+          }
           if (runResult && runResult.status === "timeout") {
             resetPyodideWorker();
           }
           return { runResult, engine: "local" };
         },
         (localError) => {
+          if (isStopError(localError) || stopRequested) {
+            throw isStopError(localError) ? localError : new Error("ユーザーにより停止されました。");
+          }
           resetPyodideWorker();
           return runPaizaCase(payload).then((runResult) => toFallbackResult(runResult, localError));
         }
       );
     }
-    return runPaizaCase(payload).then((runResult) => ({ runResult, engine: "paiza" }));
+    return runPaizaCase(payload).then((runResult) => {
+      throwIfStopped();
+      return { runResult, engine: "paiza" };
+    });
   }
 
   function runPaizaCase(payload) {
@@ -776,6 +875,9 @@
     runButton.disabled = true;
     customRunButton.disabled = true;
     setStatus("実行中...");
+    stopRequested = false;
+    activeAbort = null;
+    setStopButtonEnabled(true);
 
     const results = [];
     try {
@@ -815,12 +917,19 @@
       renderResults(results);
       setStatus(formatCompletionStatus(results));
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      setError("実行中にエラーが発生しました: " + message);
-      setStatus("エラー");
+      renderResults(results);
+      if (isStopError(error) || stopRequested) {
+        setStatus("停止しました（" + results.length + "/" + testCases.length + "件まで表示）");
+      } else {
+        const message = error instanceof Error ? error.message : String(error);
+        setError("実行中にエラーが発生しました: " + message);
+        setStatus("エラー");
+      }
     } finally {
       runButton.disabled = false;
       customRunButton.disabled = false;
+      activeAbort = null;
+      setStopButtonEnabled(false);
     }
   }
 
@@ -853,6 +962,9 @@
     runButton.disabled = true;
     customRunButton.disabled = true;
     setStatus("標準入力で実行中...");
+    stopRequested = false;
+    activeAbort = null;
+    setStopButtonEnabled(true);
 
     try {
       const executed = await runCaseWithEngine({
@@ -878,12 +990,19 @@
         formatCompletionStatus([{ engine: executed.engine, fallbackReason: executed.fallbackReason }])
       );
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      setError("実行中にエラーが発生しました: " + message);
-      setStatus("エラー");
+      if (isStopError(error) || stopRequested) {
+        renderResults([]);
+        setStatus("停止しました");
+      } else {
+        const message = error instanceof Error ? error.message : String(error);
+        setError("実行中にエラーが発生しました: " + message);
+        setStatus("エラー");
+      }
     } finally {
       runButton.disabled = false;
       customRunButton.disabled = false;
+      activeAbort = null;
+      setStopButtonEnabled(false);
     }
   }
 
